@@ -5,6 +5,7 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "sysinfo.h"
 
 struct cpu cpus[NCPU];
 
@@ -276,6 +277,9 @@ fork(void)
   np->sz = p->sz;
 
   np->parent = p;
+
+  // copy the trace mask
+  np->trace_mask = p->trace_mask;
 
   // copy saved user registers.
   *(np->trapframe) = *(p->trapframe);
@@ -692,4 +696,14 @@ procdump(void)
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
   }
+}
+
+void 
+get_proc_num(struct sysinfo * ptr) 
+{
+  int num = 0, i = 0;
+  for (; i < NPROC; i ++ )
+    if (proc[i].state != UNUSED) 
+      num ++;
+  ptr->nproc = num;
 }
