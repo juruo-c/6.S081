@@ -22,6 +22,8 @@ static void freeproc(struct proc *p);
 extern char trampoline[]; // trampoline.S
 
 // initialize the proc table at boot time.
+// 初始化所有进程的内核栈，每个栈映射一页物理内存
+// 并调用kvminithart函数，刷新TLB
 void
 procinit(void)
 {
@@ -120,12 +122,28 @@ found:
     release(&p->lock);
     return 0;
   }
+  // initialize the process kernel page table
+  p->kernel_pagetable = proc_kvminit();
+  if(p->kernel_pagetable == 0){
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+
+  // initialize the process kernel stack in kernel process kernel page table
+  char *pa = kalloc();
+  if(pa == 0)
+    panic("kalloc");
+  uint64 va = KSTACK((int) (p - proc));
+  uvmmap(p->kernel_pagetable, va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+  p->kstack = va;
 
   // Set up new context to start executing at forkret,
   // which returns to user space.
   memset(&p->context, 0, sizeof(p->context));
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
+
 
   return p;
 }
@@ -150,6 +168,12 @@ freeproc(struct proc *p)
   p->killed = 0;
   p->xstate = 0;
   p->state = UNUSED;
+
+  // free process's kernel page table
+  uvmunmap(p->kernel_pagetable, p->kstack, 1, 1);
+  p->kstack = 0;
+  proc_freewalk(p->kernel_pagetable);
+  p->kernel_pagetable = 0;
 }
 
 // Create a user page table for a given process,
@@ -472,8 +496,16 @@ scheduler(void)
         // to release its lock and then reacquire it
         // before jumping back to us.
         p->state = RUNNING;
-        c->proc = p;
+        c->proc = p;        
+        
+        // load process's kernel page table and flush the TLB
+        w_satp(MAKE_SATP(p->kernel_pagetable));
+        sfence_vma();
+
         swtch(&c->context, &p->context);
+        
+        // load kernel page table when process done
+        kvminithart();
 
         // Process is done running for now.
         // It should have changed its p->state before coming back.

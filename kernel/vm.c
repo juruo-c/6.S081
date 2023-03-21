@@ -5,6 +5,8 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
+#include "spinlock.h"
+#include "proc.h"
 
 /*
  * the kernel's page table.
@@ -15,14 +17,61 @@ extern char etext[];  // kernel.ld sets this to end of kernel code.
 
 extern char trampoline[]; // trampoline.S
 
+void 
+uvmmap(pagetable_t pagetable, uint64 va, uint64 pa, uint64 sz, int perm) 
+{
+  if(mappages(pagetable, va, sz, pa, perm) != 0)
+    panic("uvmmap");
+}
+
+/*
+ * create a direct-map page table for the given process.
+ */
+pagetable_t
+proc_kvminit() 
+{
+  pagetable_t pgtbl = (pagetable_t) kalloc();
+  if (pgtbl == 0) return 0;
+  memset(pgtbl, 0, PGSIZE);
+  
+  // uart registers
+  uvmmap(pgtbl, UART0, UART0, PGSIZE, PTE_R | PTE_W);
+
+  // virtio mmio disk interface
+  uvmmap(pgtbl, VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
+
+  // CLINT
+  uvmmap(pgtbl, CLINT, CLINT, 0x10000, PTE_R | PTE_W);
+
+  // PLIC
+  uvmmap(pgtbl, PLIC, PLIC, 0x400000, PTE_R | PTE_W);
+
+  // map kernel text executable and read-only.
+  uvmmap(pgtbl, KERNBASE, KERNBASE, (uint64)etext-KERNBASE, PTE_R | PTE_X);
+
+  // map kernel data and the physical RAM we'll make use of.
+  uvmmap(pgtbl, (uint64)etext, (uint64)etext, PHYSTOP-(uint64)etext, PTE_R | PTE_W);
+
+  // map the trampoline for trap entry/exit to
+  // the highest virtual address in the kernel.
+  uvmmap(pgtbl, TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
+
+  return pgtbl;
+}
+
 /*
  * create a direct-map page table for the kernel.
  */
 void
 kvminit()
 {
+  // 分配一页物理页，并初始化所有字节为0
   kernel_pagetable = (pagetable_t) kalloc();
   memset(kernel_pagetable, 0, PGSIZE);
+
+  // 调用一系列kvmmap函数将从给定虚拟地址开始的sz个字节地址范围，映射到给定的起始物理地址对应的范围
+  // 第一个参数是虚拟地址，第二个参数是物理地址，第三个是地址范围大小（字节），第四个参数是设置权限
+  // 将内核空间中的一些虚拟地址进行直接映射，暂时没有对内核栈进行映射
 
   // uart registers
   kvmmap(UART0, UART0, PGSIZE, PTE_R | PTE_W);
@@ -49,6 +98,7 @@ kvminit()
 
 // Switch h/w page table register to the kernel's page table,
 // and enable paging.
+// 将内核页表根页表地址写进satp寄存器中，并刷新TLB
 void
 kvminithart()
 {
@@ -68,6 +118,9 @@ kvminithart()
 //   21..29 -- 9 bits of level-1 index.
 //   12..20 -- 9 bits of level-0 index.
 //    0..11 -- 12 bits of byte offset within the page.
+// 从给定的一级页表开始，根据给定的虚拟地址，往最后一级也就是三级页表走
+// 沿途创建对应的页表并设置页表项内容（如果alloc参数为true的话）
+// 返回最后一级页表中的对应的pte地址
 pte_t *
 walk(pagetable_t pagetable, uint64 va, int alloc)
 {
@@ -132,7 +185,7 @@ kvmpa(uint64 va)
   pte_t *pte;
   uint64 pa;
   
-  pte = walk(kernel_pagetable, va, 0);
+  pte = walk(myproc()->kernel_pagetable, va, 0);
   if(pte == 0)
     panic("kvmpa");
   if((*pte & PTE_V) == 0)
@@ -145,6 +198,9 @@ kvmpa(uint64 va)
 // physical addresses starting at pa. va and size might not
 // be page-aligned. Returns 0 on success, -1 if walk() couldn't
 // allocate a needed page-table page.
+// 为指定的虚拟地址范围和物理地址范围在给定的页表中建立映射，一页一页的去建立（即以PGSIZE为单位）
+// 首先将给定的虚拟地址对齐PGSIZE，然后一页一页的找到对应的三级页表中的pte（利用walk函数）
+// 设置pte的内容为对应的物理地址即可（高44位），并设置权限码，设置当前页为有效页
 int
 mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
 {
@@ -284,6 +340,25 @@ freewalk(pagetable_t pagetable)
       pagetable[i] = 0;
     } else if(pte & PTE_V){
       panic("freewalk: leaf");
+    }
+  }
+  kfree((void*)pagetable);
+}
+
+// Recursively free process's kernel page-table pages.
+void 
+proc_freewalk(pagetable_t pagetable)
+{
+  // there are 2^9 = 512 PTEs in a page table.
+  for(int i = 0; i < 512; i++){
+    pte_t pte = pagetable[i];
+    if((pte & PTE_V) && (pte & (PTE_R|PTE_W|PTE_X)) == 0){
+      // this PTE points to a lower-level page table.
+      uint64 child = PTE2PA(pte);
+      proc_freewalk((pagetable_t)child);
+      pagetable[i] = 0;
+    } else if(pte & PTE_V){
+      pagetable[i] = 0;
     }
   }
   kfree((void*)pagetable);
